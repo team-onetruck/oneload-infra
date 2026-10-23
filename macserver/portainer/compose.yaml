@@ -1,0 +1,17 @@
+# Docker dashboard for macserver. Bound to localhost only; reach it inside the tailnet through
+# `tailscale serve` (see ../../README.md). Never expose it through Funnel: it controls every container.
+name: portainer
+
+services:
+  portainer:
+    image: portainer/portainer-ce:lts
+    restart: unless-stopped
+    command: -H unix:///var/run/docker.sock
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+volumes:
+  portainer_data:

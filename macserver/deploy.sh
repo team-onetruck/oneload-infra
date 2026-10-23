@@ -1,30 +1,27 @@
 #!/usr/bin/env bash
-# Deploys the Hangil backend and data to macserver.
+# Deploys Hangil to macserver as the docker compose project "hangil" (db, api, caddy) plus Portainer.
 #
 #   usage: deploy.sh <oneload-backend checkout> <oneload-data checkout>
 #
 # Run by the self-hosted runner in the private oneload-backend repo, which checks out all three repos.
 # Safe to run by hand on the server too.
 #
-#   ~/hangil-api        backend code + .venv            (from oneload-backend)
-#   ~/hangil-data       maps/ and panos/                (from oneload-data)
+#   ~/hangil            compose.yaml + Caddyfile          (from this repo)
+#   ~/hangil-data       maps/ and panos/                  (from oneload-data, mounted read-only)
 #   ~/hangil-api.env    settings and secrets, generated from GitHub repository secrets; never edit by hand
-#   ~/hangil-demo/      web client build (oneload-app) + Caddyfile, served on 127.0.0.1:4173
+#   ~/hangil-demo/dist  web client build (oneload-app), copied by hand
 set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 [[ $# -eq 2 ]] || { echo "usage: $0 <backend-dir> <data-dir>" >&2; exit 2; }
-BACKEND_SRC="$(cd "$1" && pwd)"
+export BACKEND_DIR="$(cd "$1" && pwd)"
 DATA_SRC="$(cd "$2" && pwd)"
 INFRA="$(cd "$(dirname "$0")" && pwd)"
 
-APP="$HOME/hangil-api"
+PROJECT="$HOME/hangil"
 DATA="$HOME/hangil-data"
 ENV_FILE="$HOME/hangil-api.env"
-AGENTS="$HOME/Library/LaunchAgents"
-DOMAIN="gui/$(id -u)"
-
-rsync -a --delete --exclude .git --exclude .venv --exclude .env "$BACKEND_SRC/" "$APP/"
+compose() { docker compose --project-directory "$PROJECT" -f "$PROJECT/compose.yaml" "$@"; }
 
 # Settings and secrets come only from GitHub repository secrets: the workflow maps each one to an APP_*
 # variable, and every non-empty APP_* is written to $ENV_FILE without the prefix, replacing the old file.
@@ -41,54 +38,36 @@ PY
 fi
 touch "$ENV_FILE" && chmod 600 "$ENV_FILE"
 
-cd "$APP"
-docker compose -p hangil up -d --wait db
-uv sync --frozen --no-dev
+mkdir -p "$PROJECT" "$DATA" "$HOME/hangil-demo/dist"
+cp "$INFRA/compose.yaml" "$INFRA/Caddyfile" "$PROJECT/"
 
-# Load the new maps with the new code before anything is switched over: a broken map stops here,
+compose build api
+
+# Load the new maps with the new image before anything is switched over: a broken map stops here,
 # while the running API keeps serving the previous data.
-MAP_DIR="$DATA_SRC/maps" uv run --frozen --no-dev python -c \
+compose run --rm --no-deps -v "$DATA_SRC/maps:/check:ro" -e MAP_DIR=/check api python -c \
   "from app.config import get_settings; from app.domain.mapdata import MapStore; \
 print('maps OK:', [m.map_id + '@' + m.version for m in MapStore.load(get_settings().map_dir).all()])"
-mkdir -p "$DATA"
 rsync -a --delete --exclude .git "$DATA_SRC/maps" "$DATA_SRC/panos" "$DATA/"
 
-uv run --frozen --no-dev --env-file "$ENV_FILE" alembic upgrade head
+compose up -d --wait db
+compose run --rm api alembic upgrade head
+compose up -d --wait --remove-orphans
+# The Caddyfile is a bind mount, so a changed file needs an explicit reload.
+compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 
-mkdir -p "$HOME/hangil-demo" "$AGENTS"
-cp "$INFRA/Caddyfile" "$HOME/hangil-demo/Caddyfile"
-
-stop_agent() {
-  local label=$1
-  launchctl bootout "$DOMAIN/$label" 2>/dev/null || return 0
-  # bootout returns before the job is gone, and bootstrapping it again too early fails with EIO.
-  for _ in $(seq 40); do
-    launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || return 0
-    sleep 0.25
-  done
-}
-
-start_agent() {
-  local label=$1
-  sed "s|__HOME__|$HOME|g" "$INFRA/launchd/$label.plist" > "$AGENTS/$label.plist"
-  launchctl bootstrap "$DOMAIN" "$AGENTS/$label.plist"
-}
-
-stop_agent com.onetruck.hangil-api
-start_agent com.onetruck.hangil-api
-
-stop_agent com.onetruck.hangil-caddy
-caddy stop >/dev/null 2>&1 || true # a Caddy started by hand (outside launchd) would keep the port
-start_agent com.onetruck.hangil-caddy
+docker compose -f "$INFRA/portainer/compose.yaml" up -d
+docker image prune -f --filter "label=org.opencontainers.image.title=hangil-api" >/dev/null
 
 for _ in $(seq 30); do
   if curl -fsS http://127.0.0.1:4173/api/v1/health; then
-    echo && echo "Deployed backend $(git -C "$BACKEND_SRC" rev-parse --short HEAD 2>/dev/null || echo '?')," \
+    echo && echo "Deployed backend $(git -C "$BACKEND_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')," \
       "data $(git -C "$DATA_SRC" rev-parse --short HEAD 2>/dev/null || echo '?')"
     exit 0
   fi
   sleep 1
 done
 echo "API did not become healthy" >&2
-tail -50 "$HOME/Library/Logs/hangil-api.log" >&2
+compose ps >&2
+compose logs --tail 50 api >&2
 exit 1

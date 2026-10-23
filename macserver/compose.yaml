@@ -1,0 +1,56 @@
+# Hangil on macserver: one compose project ("hangil") for the database, the API and the web front door.
+# deploy.sh copies this file to ~/hangil and runs it there; see ../README.md.
+#
+#   BACKEND_DIR  oneload-backend checkout to build the API image from (only needed when building)
+name: hangil
+
+services:
+  db:
+    # pgvector is bundled so the RAG module can add vector columns without changing the image.
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hangil
+      POSTGRES_PASSWORD: hangil # reachable only on the compose network, never published
+      POSTGRES_DB: hangil
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hangil"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: hangil-api:latest
+    build:
+      context: ${BACKEND_DIR:-.}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ${HOME}/hangil-api.env # generated from GitHub repository secrets by deploy.sh
+    environment:
+      DATABASE_URL: postgresql+psycopg://hangil:hangil@db:5432/hangil
+      MAP_DIR: /data/maps
+    volumes:
+      - ${HOME}/hangil-data/maps:/data/maps:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # Started, not healthy: the web client and photos stay up even while the API restarts.
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:4173:4173" # Tailscale Funnel :10000 points here
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${HOME}/hangil-demo/dist:/srv/web:ro
+      - ${HOME}/hangil-data/panos:/srv/data/panos:ro
+      - caddy_data:/data
+
+volumes:
+  pgdata:
+  caddy_data:
