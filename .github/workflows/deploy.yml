@@ -1,0 +1,58 @@
+# The one Hangil deploy. oneload-backend, oneload-app and oneload_agent call it after their main
+# passes CI; it runs on the caller's own self-hosted runner on macserver and makes the server run
+# main of every repo, whichever one changed. This repo has no runner and never runs it itself.
+#
+# Caller:
+#   deploy:
+#     needs: [<ci jobs>]
+#     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+#     uses: team-onetruck/oneload-infra/.github/workflows/deploy.yml@main
+#     secrets: inherit   # oneload-backend only: server settings live in its repository secrets
+name: Deploy
+
+on:
+  workflow_call:
+    secrets:
+      OPENAI_API_KEY:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS, hangil]
+    # Per calling repo; deploy.sh also holds a lock so the three runners never deploy at once.
+    concurrency:
+      group: deploy-macserver
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: team-onetruck/oneload-backend
+          ref: main
+          path: backend
+      - uses: actions/checkout@v4
+        with:
+          repository: team-onetruck/oneload_agent
+          ref: main
+          path: agent
+      - uses: actions/checkout@v4
+        with:
+          repository: team-onetruck/oneload-data
+          ref: main
+          path: data
+      - uses: actions/checkout@v4
+        with:
+          repository: team-onetruck/oneload-app
+          ref: main
+          path: web
+      - uses: actions/checkout@v4
+        with:
+          repository: team-onetruck/oneload-infra
+          ref: main
+          path: infra
+      - run: infra/macserver/deploy.sh backend data web agent
+        env:
+          # Only oneload-backend's deploy rewrites the server settings; the others keep them.
+          HANGIL_WRITE_SETTINGS: ${{ github.repository == 'team-onetruck/oneload-backend' }}
+          # Server settings: one repository secret of oneload-backend per line, exposed to deploy.sh
+          # with an APP_ prefix. Add a line here (and under workflow_call.secrets) for a new setting.
+          APP_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

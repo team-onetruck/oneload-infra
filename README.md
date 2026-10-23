@@ -22,43 +22,41 @@ flowchart LR
 
 | Repo | Visibility | Holds |
 | --- | --- | --- |
-| [oneload-backend](https://github.com/team-onetruck/oneload-backend) | public | API code + `Dockerfile`, tests, CI, the deploy workflow |
+| [oneload-backend](https://github.com/team-onetruck/oneload-backend) | public | API code + `Dockerfile`, tests, CI |
 | [oneload-data](https://github.com/team-onetruck/oneload-data) | public | maps and street-view photos |
-| oneload-infra (this) | public | `macserver/compose.yaml`, Caddyfile, `web.Dockerfile`, `deploy.sh`, Portainer |
+| oneload-infra (this) | public | the shared deploy workflow, `macserver/compose.yaml`, Caddyfile, `web.Dockerfile`, `deploy.sh`, Portainer |
 | [oneload-app](https://github.com/team-onetruck/oneload-app) | public | web client, built into the `hangil-web` image |
-| [oneload_agent](https://github.com/team-onetruck/oneload_agent) | public | conversation and vision agent, a pinned dependency of the API |
+| [oneload_agent](https://github.com/team-onetruck/oneload_agent) | public | conversation and vision agent, installed into the `hangil-api` image |
 
 ## Deploying
 
-The **only** deploy path is the `deploy` job in oneload-backend's `ci.yml`. It runs on the self-hosted runner `macserver-hangil` (label `hangil`), checks out backend, infra, data and app, and runs:
+There is one deploy, `.github/workflows/deploy.yml` in this repo (a reusable workflow). oneload-backend, oneload-app and oneload_agent call it from their CI after `main` passes, and it runs on **the caller's own self-hosted runner** on macserver (label `hangil`). It always deploys `main` of every repo, whichever one changed, by checking all of them out and running:
 
 ```sh
-macserver/deploy.sh <backend-dir> <data-dir> <app-dir>
+macserver/deploy.sh <backend-dir> <data-dir> <app-dir> <agent-dir>
 ```
 
 In order, the script:
 
-1. writes `~/hangil-api.env` from repository secrets;
-2. copies `compose.yaml`, `Caddyfile` and `web.Dockerfile` to `~/hangil`;
-3. builds the `hangil-api` image from the backend checkout and the `hangil-web` image from the app checkout;
-4. loads the new maps with the new image and stops if they are broken (the running API keeps its data);
-5. syncs `maps/` and `panos/` to `~/hangil-data`, migrates the database, and runs `docker compose up -d --wait`;
-6. reloads Caddy, makes sure Portainer is up, and prunes old images.
+1. waits for any other deploy on the machine to finish (`lockf`), since three runners can start one;
+2. writes `~/hangil-api.env` from repository secrets, only when oneload-backend started the deploy;
+3. pins the backend checkout to the agent checkout's commit (`uv add`, never committed);
+4. copies `compose.yaml`, `Caddyfile` and `web.Dockerfile` to `~/hangil`;
+5. builds the `hangil-api` image (backend + agent) and the `hangil-web` image (app);
+6. loads the new maps with the new image and stops if they are broken (the running API keeps its data);
+7. syncs `maps/` and `panos/` to `~/hangil-data`, migrates the database, and runs `docker compose up -d --wait`;
+8. reloads Caddy, makes sure Portainer is up, and prunes old images.
 
 All containers use `restart: unless-stopped`, and Colima starts as a Homebrew service, so the stack comes back after a reboot.
 
-What starts a deploy:
-
-| Change in | Starts the deploy by |
+| Change in | Deploys through |
 | --- | --- |
-| oneload-backend | its own push to `main` |
-| oneload-app | its CI's `deploy` job, after `main` passes |
-| oneload_agent | its CI's `deploy` job, after `main` passes: oneload-backend's `agent-bump.yml` pins the new commit, then starts CI / Deploy |
-| oneload-data, this repo, a secret | hand: `gh workflow run ci.yml -R team-onetruck/oneload-backend` |
+| oneload-backend | its CI, on its runner `macserver-hangil` |
+| oneload-app | its CI, on its runner `macserver-hangil-app` |
+| oneload_agent | its CI, on its runner `macserver-hangil-agent` |
+| oneload-data, this repo, a secret | no runner; by hand: `gh workflow run ci.yml -R team-onetruck/oneload-backend` |
 
-The app and agent hand-offs use the secret `HANGIL_DEPLOY_TOKEN` in those repos: a fine-grained token for oneload-backend only, with Actions read and write.
-
-All team repos are public now. Only oneload-backend has a runner, and its fork PR workflows wait for a maintainer's approval; **never** approve a fork PR run that touches `.github/`, and never attach a runner to another repo.
+**All team repos are public, and three of them have a runner on macserver.** The only guard is that fork PR workflows wait for a maintainer's approval: **never** approve a fork PR run that touches `.github/`.
 
 ## Looking at it
 
@@ -69,7 +67,7 @@ Portainer asks for an admin account on the first visit and locks setup after 5 m
 
 ## Settings and secrets
 
-GitHub repository secrets in oneload-backend. The deploy step maps each one to an `APP_*` variable and `deploy.sh` writes them to `~/hangil-api.env` (mode 600, replaced on every deploy), which the `api` service loads. Add a setting with `gh secret set NAME -R team-onetruck/oneload-backend` plus one `APP_NAME: ${{ secrets.NAME }}` line in that workflow.
+GitHub repository secrets in oneload-backend. When oneload-backend deploys, `.github/workflows/deploy.yml` maps each one to an `APP_*` variable and `deploy.sh` writes them to `~/hangil-api.env` (mode 600, replaced), which the `api` service loads. Deploys started by the app or agent repos keep the file as it is. Add a setting with `gh secret set NAME -R team-onetruck/oneload-backend` plus the secret under `workflow_call.secrets` and one `APP_NAME: ${{ secrets.NAME }}` line in this repo's `deploy.yml`.
 
 ## Web client
 
@@ -79,5 +77,5 @@ Built from oneload-app's `main` on every deploy (`web.Dockerfile`: `pnpm install
 
 - Public: `tailscale funnel --bg --https=10000 http://127.0.0.1:4173`. Ports 443 and 8443 on this machine belong to another project.
 - Portainer, tailnet only: `tailscale serve --bg --https=9443 http://127.0.0.1:9000`.
-- Runner: registered to oneload-backend only, installed with `./svc.sh install` in `~/actions-runner-hangil`. Every team repo requires maintainer approval before a fork PR's workflows run (Settings → Actions → "all outside contributors").
-- Tools from Homebrew: `colima`, `docker`, `docker-compose`.
+- Runners (label `hangil`, each installed with `./svc.sh install`): `macserver-hangil` for oneload-backend in `~/actions-runner-hangil`, `macserver-hangil-app` for oneload-app in `~/actions-runner-hangil-app`, `macserver-hangil-agent` for oneload_agent in `~/actions-runner-hangil-agent`. Every team repo requires maintainer approval before a fork PR's workflows run (Settings → Actions → "all outside contributors").
+- Tools from Homebrew: `colima`, `docker`, `docker-compose`, `uv` (rewrites the agent pin during a deploy).
