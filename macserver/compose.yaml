@@ -1,7 +1,8 @@
 # Hangil on macserver: one compose project ("hangil") for the database, the API and the web front door.
 # deploy.sh copies this file to ~/hangil and runs it there; see ../README.md.
 #
-#   BACKEND_DIR  oneload-backend checkout to build the API image from (only needed when building)
+#   BACKEND_DIR  oneload-backend checkout to build the API image from  (only needed when building)
+#   WEB_DIR      oneload-app checkout to build the web image from       (only needed when building)
 name: hangil
 
 services:
@@ -38,7 +39,13 @@ services:
       - ${HOME}/hangil-data/maps:/data/maps:ro
 
   caddy:
-    image: caddy:2-alpine
+    # The web client is baked into this image (web.Dockerfile); Caddyfile and photos stay mounted.
+    image: hangil-web:latest
+    build:
+      context: .
+      dockerfile: web.Dockerfile
+      additional_contexts:
+        app: ${WEB_DIR:-.}
     restart: unless-stopped
     # Started, not healthy: the web client and photos stay up even while the API restarts.
     depends_on:
@@ -47,7 +54,6 @@ services:
       - "127.0.0.1:4173:4173" # Tailscale Funnel :10000 points here
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ${HOME}/hangil-demo/dist:/srv/web:ro
       - ${HOME}/hangil-data/panos:/srv/data/panos:ro
       - caddy_data:/data
 

@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 # Deploys Hangil to macserver as the docker compose project "hangil" (db, api, caddy) plus Portainer.
 #
-#   usage: deploy.sh <oneload-backend checkout> <oneload-data checkout>
+#   usage: deploy.sh <oneload-backend checkout> <oneload-data checkout> <oneload-app checkout>
 #
-# Run by the self-hosted runner in the private oneload-backend repo, which checks out all three repos.
+# Run by the self-hosted runner of oneload-backend, which checks out all four repos.
 # Safe to run by hand on the server too.
 #
-#   ~/hangil            compose.yaml + Caddyfile          (from this repo)
-#   ~/hangil-data       maps/ and panos/                  (from oneload-data, mounted read-only)
+#   ~/hangil            compose.yaml, Caddyfile, web.Dockerfile   (from this repo)
+#   ~/hangil-data       maps/ and panos/                          (from oneload-data, mounted read-only)
 #   ~/hangil-api.env    settings and secrets, generated from GitHub repository secrets; never edit by hand
-#   ~/hangil-demo/dist  web client build (oneload-app), copied by hand
+#   images              hangil-api (oneload-backend), hangil-web (oneload-app built and served by Caddy)
 set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
-[[ $# -eq 2 ]] || { echo "usage: $0 <backend-dir> <data-dir>" >&2; exit 2; }
+[[ $# -eq 3 ]] || { echo "usage: $0 <backend-dir> <data-dir> <web-dir>" >&2; exit 2; }
 export BACKEND_DIR="$(cd "$1" && pwd)"
 DATA_SRC="$(cd "$2" && pwd)"
+export WEB_DIR="$(cd "$3" && pwd)"
 INFRA="$(cd "$(dirname "$0")" && pwd)"
 
 PROJECT="$HOME/hangil"
 DATA="$HOME/hangil-data"
 ENV_FILE="$HOME/hangil-api.env"
 compose() { docker compose --project-directory "$PROJECT" -f "$PROJECT/compose.yaml" "$@"; }
+rev() { git -C "$1" rev-parse --short HEAD 2>/dev/null || echo '?'; }
 
 # Settings and secrets come only from GitHub repository secrets: the workflow maps each one to an APP_*
 # variable, and every non-empty APP_* is written to $ENV_FILE without the prefix, replacing the old file.
@@ -38,10 +40,10 @@ PY
 fi
 touch "$ENV_FILE" && chmod 600 "$ENV_FILE"
 
-mkdir -p "$PROJECT" "$DATA" "$HOME/hangil-demo/dist"
-cp "$INFRA/compose.yaml" "$INFRA/Caddyfile" "$PROJECT/"
+mkdir -p "$PROJECT" "$DATA"
+cp "$INFRA/compose.yaml" "$INFRA/Caddyfile" "$INFRA/web.Dockerfile" "$PROJECT/"
 
-compose build api
+compose build api caddy
 
 # Load the new maps with the new image before anything is switched over: a broken map stops here,
 # while the running API keeps serving the previous data.
@@ -53,16 +55,17 @@ rsync -a --delete --exclude .git "$DATA_SRC/maps" "$DATA_SRC/panos" "$DATA/"
 compose up -d --wait db
 compose run --rm api alembic upgrade head
 compose up -d --wait --remove-orphans
-# The Caddyfile is a bind mount, so a changed file needs an explicit reload.
+# The Caddyfile is a bind mount, so a changed file needs an explicit reload when caddy was not recreated.
 compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 
 docker compose -f "$INFRA/portainer/compose.yaml" up -d
-docker image prune -f --filter "label=org.opencontainers.image.title=hangil-api" >/dev/null
+for image in hangil-api hangil-web; do
+  docker image prune -f --filter "label=org.opencontainers.image.title=$image" >/dev/null
+done
 
 for _ in $(seq 30); do
   if curl -fsS http://127.0.0.1:4173/api/v1/health; then
-    echo && echo "Deployed backend $(git -C "$BACKEND_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')," \
-      "data $(git -C "$DATA_SRC" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    echo && echo "Deployed backend $(rev "$BACKEND_DIR"), data $(rev "$DATA_SRC"), web $(rev "$WEB_DIR")"
     exit 0
   fi
   sleep 1
