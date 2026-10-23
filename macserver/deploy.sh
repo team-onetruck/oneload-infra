@@ -50,8 +50,7 @@ touch "$ENV_FILE" && chmod 600 "$ENV_FILE"
 
 # The API always runs oneload_agent's checked-out commit, whichever repo started the deploy. The pin
 # is rewritten in this backend checkout only and never committed.
-uv add --project "$BACKEND_DIR" --no-sync --quiet \
-  "oneload-agent @ https://github.com/team-onetruck/oneload_agent/archive/$(git -C "$AGENT_SRC" rev-parse HEAD).tar.gz"
+"$BACKEND_DIR/scripts/pin_agent.sh" "$(git -C "$AGENT_SRC" rev-parse HEAD)"
 
 mkdir -p "$PROJECT" "$DATA"
 cp "$INFRA/compose.yaml" "$INFRA/Caddyfile" "$INFRA/web.Dockerfile" "$PROJECT/"
